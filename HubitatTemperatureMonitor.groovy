@@ -33,6 +33,8 @@
  *  v1.16 - Added 5-minute minimum interval for restore notifications to prevent duplicates (May 5, 2025)
  *  v1.17 - Fixed restore notification logic to use separate timestamp from out-of-range notifications (May 5, 2025)
  *  v1.18 - Added state cleanup to remove duplicate entries and fixed device ID consistency (May 5, 2025)
+ *  v1.19 - Added configurable delay before first out-of-range notification (default 30 minutes) (July 6, 2025)
+ *  v1.20 - Ensure initialDelay and notifyInterval are always initialized to defaults in initialize() (July 8, 2025)
  *
  */
 
@@ -66,7 +68,8 @@ def mainPage() {
         }
         
         section("Notification Options") {
-            input "notifyInterval", "number", title: "Time between repeat notifications (minutes)", defaultValue: 60
+            input "initialDelay", "number", title: "Delay before first notification (minutes)", defaultValue: 30, description: "How long temperature must be out of range before first notification"
+            input "notifyInterval", "number", title: "Time between repeat notifications (minutes)", defaultValue: 60, description: "How often to send repeat notifications"
             input "notifyOnRestore", "bool", title: "Notify when temperature returns to normal range?", defaultValue: true
         }
         
@@ -88,6 +91,16 @@ def updated() {
 
 def initialize() {
     if (logEnable) log.debug "Initializing Temperature Monitor"
+    
+    // Ensure initialDelay and notifyInterval are set to defaults if not provided
+    if (initialDelay == null) {
+        initialDelay = 30
+        if (logEnable) log.debug "initialDelay not set, defaulting to 30 minutes"
+    }
+    if (notifyInterval == null) {
+        notifyInterval = 60
+        if (logEnable) log.debug "notifyInterval not set, defaulting to 60 minutes"
+    }
     
     // Subscribe to temperature events from each sensor
     tempSensors.each { sensor ->
@@ -233,25 +246,12 @@ def temperatureHandler(evt) {
     
     // Handle temperature going out of range
     if (wasInRange && !inRange) {
-        // Temperature just went out of range - notify immediately
+        // Temperature just went out of range - start tracking but don't notify immediately
         sensorStatus.outOfRangeStart = now
-        sensorStatus.lastNotification = now
-        sensorStatus.notified = true
-        
-        def message = ""
-        if (currentTemp < minTemp) {
-            message = "Temperature Alert: ${deviceName} is too cold at ${currentTemp}°F (minimum: ${minTemp}°F)"
-        } else {
-            message = "Temperature Alert: ${deviceName} is too hot at ${currentTemp}°F (maximum: ${maxTemp}°F)"
-        }
-        
-        sendNotification(message)
-        sensorStatus.lastNotification = now
-        sensorStatus.notified = true
+        sensorStatus.notified = false
         
         if (logEnable) {
-            log.debug "Sent immediate notification: ${message}"
-            log.debug "Set lastNotification timestamp to: ${now}"
+            log.debug "Temperature went out of range. Starting ${initialDelay}-minute delay timer."
         }
     }
     // Handle temperature returning to range
@@ -282,19 +282,38 @@ def temperatureHandler(evt) {
     }
     // Handle temperature still out of range
     else if (!inRange && sensorStatus.outOfRangeStart > 0) {
+        def initialDelayMillis = initialDelay * 60 * 1000
         def intervalMillis = notifyInterval * 60 * 1000
+        def timeSinceOutOfRange = now - sensorStatus.outOfRangeStart
         def timeSinceLastNotification = now - sensorStatus.lastNotification
         
         if (logEnable) {
-            log.debug "Temperature still out of range. Checking for repeat notification."
+            log.debug "Temperature still out of range. Checking for notifications."
+            log.debug "Time since out of range: ${timeSinceOutOfRange / 60000} minutes"
+            log.debug "Initial delay required: ${initialDelay} minutes"
             log.debug "Time since last notification: ${timeSinceLastNotification / 60000} minutes"
-            log.debug "Interval required: ${notifyInterval} minutes"
-            log.debug "Last notification timestamp: ${sensorStatus.lastNotification}"
-            log.debug "Current timestamp: ${now}"
+            log.debug "Repeat interval: ${notifyInterval} minutes"
         }
         
+        // Check if we should send first notification (after initial delay)
+        if (!sensorStatus.notified && timeSinceOutOfRange >= initialDelayMillis) {
+            def message = ""
+            if (currentTemp < minTemp) {
+                message = "Temperature Alert: ${deviceName} is too cold at ${currentTemp}°F (minimum: ${minTemp}°F)"
+            } else {
+                message = "Temperature Alert: ${deviceName} is too hot at ${currentTemp}°F (maximum: ${maxTemp}°F)"
+            }
+            
+            sendNotification(message)
+            sensorStatus.lastNotification = now
+            sensorStatus.notified = true
+            
+            if (logEnable) {
+                log.debug "Sent first notification after ${initialDelay}-minute delay: ${message}"
+            }
+        }
         // Check if we should send repeat notification
-        if (timeSinceLastNotification >= intervalMillis) {
+        else if (sensorStatus.notified && timeSinceLastNotification >= intervalMillis) {
             def message = ""
             if (currentTemp < minTemp) {
                 message = "Temperature Alert: ${deviceName} is still too cold at ${currentTemp}°F (minimum: ${minTemp}°F)"
@@ -307,11 +326,14 @@ def temperatureHandler(evt) {
             
             if (logEnable) {
                 log.debug "Sent repeat notification: ${message}"
-                log.debug "Updated lastNotification timestamp to: ${now}"
             }
         } else {
             if (logEnable) {
-                log.debug "Not enough time has passed for repeat notification"
+                if (!sensorStatus.notified) {
+                    log.debug "Waiting for initial delay to complete (${(initialDelayMillis - timeSinceOutOfRange) / 60000} minutes remaining)"
+                } else {
+                    log.debug "Not enough time has passed for repeat notification"
+                }
             }
         }
     }
